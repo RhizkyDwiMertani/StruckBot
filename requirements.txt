@@ -1,4 +1,6 @@
 streamlit
+pandas
 gspread
 google-auth
-pandas
+google-cloud-vision
+google-api-python-client
