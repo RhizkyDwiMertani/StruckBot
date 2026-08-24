@@ -5,9 +5,11 @@ from datetime import date, datetime
 
 import gspread
 import pandas as pd
+import pytesseract
 import streamlit as st
 
-from google.cloud import vision
+from PIL import Image, ImageEnhance, ImageFilter, ImageOps
+
 from google.oauth2.service_account import Credentials
 from googleapiclient.discovery import build
 from googleapiclient.http import MediaIoBaseUpload
@@ -30,28 +32,15 @@ st.set_page_config(
 
 WORKSHEET_NAME = "Receipts"
 
-# Google Sheets
-# Drive scope diperlukan karena beberapa operasi
-# Google Sheets/gspread juga berinteraksi dengan Drive.
 SHEETS_SCOPES = [
     "https://www.googleapis.com/auth/spreadsheets",
     "https://www.googleapis.com/auth/drive",
 ]
 
-# Google Drive
 DRIVE_SCOPES = [
     "https://www.googleapis.com/auth/drive",
 ]
 
-# Google Cloud Vision
-VISION_SCOPES = [
-    "https://www.googleapis.com/auth/cloud-platform",
-]
-
-
-# ============================================================
-# EXPECTED GOOGLE SHEETS HEADER
-# ============================================================
 
 EXPECTED_HEADERS = [
     "Receipt_ID",
@@ -117,8 +106,7 @@ def get_service_account_info():
     if "google_service_account" not in st.secrets:
 
         raise RuntimeError(
-            "Secret [google_service_account] tidak ditemukan. "
-            "Masukkan Google Service Account ke Streamlit Secrets."
+            "Secret [google_service_account] tidak ditemukan."
         )
 
     return dict(
@@ -128,9 +116,7 @@ def get_service_account_info():
 
 def get_credentials(scopes):
 
-    service_account_info = (
-        get_service_account_info()
-    )
+    info = get_service_account_info()
 
     required_fields = [
         "type",
@@ -142,32 +128,28 @@ def get_credentials(scopes):
     missing_fields = [
         field
         for field in required_fields
-        if not service_account_info.get(field)
+        if not info.get(field)
     ]
 
     if missing_fields:
 
         raise RuntimeError(
-            "Field Google credential belum lengkap: "
+            "Credential Google belum lengkap: "
             + ", ".join(missing_fields)
         )
 
     try:
 
-        credentials = (
-            Credentials.from_service_account_info(
-                service_account_info,
-                scopes=scopes,
-            )
+        return Credentials.from_service_account_info(
+            info,
+            scopes=scopes,
         )
-
-        return credentials
 
     except Exception as exc:
 
         raise RuntimeError(
             "Gagal membuat Google credentials. "
-            "Periksa private_key dan konfigurasi Streamlit Secrets."
+            "Periksa konfigurasi Streamlit Secrets."
         ) from exc
 
 
@@ -189,15 +171,14 @@ def get_spreadsheet_id():
     if not spreadsheet_id:
 
         raise RuntimeError(
-            "google_spreadsheet_id belum ditemukan "
-            "di Streamlit Secrets."
+            "google_spreadsheet_id belum diisi."
         )
 
     return spreadsheet_id
 
 
 # ============================================================
-# GOOGLE DRIVE FOLDER ID
+# GOOGLE DRIVE FOLDER
 # ============================================================
 
 def get_drive_folder_id():
@@ -213,25 +194,7 @@ def get_drive_folder_id():
 
 
 # ============================================================
-# GOOGLE VISION CLIENT
-# ============================================================
-
-@st.cache_resource
-def get_vision_client():
-
-    credentials = get_credentials(
-        VISION_SCOPES
-    )
-
-    client = vision.ImageAnnotatorClient(
-        credentials=credentials
-    )
-
-    return client
-
-
-# ============================================================
-# GOOGLE SHEETS CLIENT
+# GOOGLE SHEETS
 # ============================================================
 
 @st.cache_resource
@@ -241,16 +204,10 @@ def get_sheet_client():
         SHEETS_SCOPES
     )
 
-    client = gspread.authorize(
+    return gspread.authorize(
         credentials
     )
 
-    return client
-
-
-# ============================================================
-# GOOGLE WORKSHEET
-# ============================================================
 
 @st.cache_resource
 def get_worksheet():
@@ -269,8 +226,7 @@ def get_worksheet():
 
         raise RuntimeError(
             "Tidak dapat membuka Google Spreadsheet. "
-            "Pastikan Spreadsheet ID benar dan Spreadsheet "
-            "sudah dibagikan kepada email Service Account sebagai Editor."
+            "Periksa Spreadsheet ID dan permission Service Account."
         ) from exc
 
     try:
@@ -282,15 +238,14 @@ def get_worksheet():
     except Exception as exc:
 
         raise RuntimeError(
-            f"Worksheet '{WORKSHEET_NAME}' tidak ditemukan. "
-            f"Buat sheet dengan nama '{WORKSHEET_NAME}'."
+            f"Worksheet '{WORKSHEET_NAME}' tidak ditemukan."
         ) from exc
 
     return worksheet
 
 
 # ============================================================
-# GOOGLE DRIVE SERVICE
+# GOOGLE DRIVE
 # ============================================================
 
 @st.cache_resource
@@ -300,91 +255,149 @@ def get_drive_service():
         DRIVE_SCOPES
     )
 
-    service = build(
+    return build(
         "drive",
         "v3",
         credentials=credentials,
         cache_discovery=False,
     )
 
-    return service
+
+# ============================================================
+# TESSERACT LANGUAGE
+# ============================================================
+
+@st.cache_resource
+def get_ocr_language():
+
+    try:
+
+        languages = pytesseract.get_languages(
+            config=""
+        )
+
+    except Exception:
+
+        languages = []
+
+    if (
+        "ind" in languages
+        and "eng" in languages
+    ):
+
+        return "ind+eng"
+
+    if "ind" in languages:
+
+        return "ind"
+
+    return "eng"
 
 
 # ============================================================
-# GOOGLE CONNECTION TEST
+# IMAGE PREPROCESSING
 # ============================================================
 
-def test_google_connections():
+def preprocess_image(image):
 
-    info = get_service_account_info()
+    # Convert to RGB
+    image = image.convert("RGB")
 
-    results = {
-        "project_id": info.get(
-            "project_id",
-            "",
-        ),
-        "client_email": info.get(
-            "client_email",
-            "",
-        ),
-        "vision": False,
-        "sheets": False,
-        "drive": False,
-    }
+    # Upscale
+    width, height = image.size
 
-    # Vision
-    get_vision_client()
+    scale = 2
 
-    results["vision"] = True
+    image = image.resize(
+        (
+            width * scale,
+            height * scale,
+        )
+    )
 
-    # Sheets
-    worksheet = get_worksheet()
+    # Convert grayscale
+    image = ImageOps.grayscale(
+        image
+    )
 
-    if worksheet:
-        results["sheets"] = True
+    # Improve contrast
+    image = ImageEnhance.Contrast(
+        image
+    ).enhance(2.0)
 
-    # Drive
-    get_drive_service()
+    # Improve sharpness
+    image = ImageEnhance.Sharpness(
+        image
+    ).enhance(2.0)
 
-    results["drive"] = True
+    # Slight denoise
+    image = image.filter(
+        ImageFilter.MedianFilter(
+            size=3
+        )
+    )
 
-    return results
+    # Threshold
+    image = image.point(
+        lambda pixel: 255
+        if pixel > 160
+        else 0
+    )
+
+    return image
 
 
 # ============================================================
-# OCR
+# TESSERACT OCR
 # ============================================================
 
 def perform_ocr(image_bytes):
 
-    client = get_vision_client()
+    try:
 
-    image = vision.Image(
-        content=image_bytes
-    )
-
-    response = client.document_text_detection(
-        image=image
-    )
-
-    if response.error.message:
-
-        raise RuntimeError(
-            "Google Vision API error: "
-            + response.error.message
+        image = Image.open(
+            io.BytesIO(image_bytes)
         )
 
-    if (
-        not response.full_text_annotation
-        or not response.full_text_annotation.text
-    ):
+    except Exception as exc:
 
-        return ""
+        raise RuntimeError(
+            "File gambar tidak dapat dibuka."
+        ) from exc
 
-    return (
-        response.full_text_annotation.text
-        .strip()
+    processed_image = preprocess_image(
+        image
     )
+
+    language = get_ocr_language()
+
+    config = (
+        "--oem 3 "
+        "--psm 6"
+    )
+
+    try:
+
+        text = pytesseract.image_to_string(
+            processed_image,
+            lang=language,
+            config=config,
+        )
+
+    except pytesseract.TesseractNotFoundError as exc:
+
+        raise RuntimeError(
+            "Tesseract OCR tidak ditemukan. "
+            "Pastikan packages.txt berisi tesseract-ocr."
+        ) from exc
+
+    except Exception as exc:
+
+        raise RuntimeError(
+            "Tesseract OCR gagal dijalankan."
+        ) from exc
+
+    return text.strip()
 
 
 # ============================================================
@@ -400,6 +413,13 @@ def parse_amount(value):
 
     if not text:
         return 0
+
+    text = (
+        text
+        .replace("Rp", "")
+        .replace("rp", "")
+        .replace(" ", "")
+    )
 
     digits = re.sub(
         r"[^0-9]",
@@ -420,7 +440,7 @@ def parse_amount(value):
 def extract_date(text):
 
     patterns = [
-        r"\b(\d{1,2})[\/\-](\d{1,2})[\/\-](\d{2,4})\b",
+        r"\b(\d{1,2})[\/\-\.](\d{1,2})[\/\-\.](\d{2,4})\b",
         r"\b(\d{1,2})\s+(\d{1,2})\s+(\d{2,4})\b",
     ]
 
@@ -448,6 +468,7 @@ def extract_date(text):
                 )
 
                 if year < 100:
+
                     year += 2000
 
                 return date(
@@ -490,6 +511,8 @@ def extract_store(text):
         "address",
         "telp",
         "phone",
+        "nomor",
+        "no.",
     ]
 
     for line in lines[:10]:
@@ -529,7 +552,9 @@ def extract_amount_by_keyword(
     keywords,
 ):
 
-    for line in text.splitlines():
+    lines = text.splitlines()
+
+    for line in lines:
 
         lower = line.lower()
 
@@ -588,6 +613,9 @@ def extract_items(text):
         "cashier",
         "terima kasih",
         "thank",
+        "nomor",
+        "telp",
+        "phone",
     ]
 
     items = []
@@ -607,6 +635,14 @@ def extract_items(text):
         ):
             continue
 
+        # Remove leading bullet/symbol
+        line = re.sub(
+            r"^[•*\-]+\s*",
+            "",
+            line,
+        )
+
+        # Find price at end of line
         price_match = re.search(
             r"(?:rp\.?\s*)?([\d.,]+)\s*$",
             line,
@@ -624,16 +660,28 @@ def extract_items(text):
             continue
 
         item_name = (
-            line[:price_match.start()]
+            line[
+                :price_match.start()
+            ]
             .strip()
         )
 
         if len(item_name) < 2:
             continue
 
+        # Ignore lines that are mostly numeric
+        if len(
+            re.findall(
+                r"\d",
+                item_name,
+            )
+        ) > len(item_name) * 0.5:
+
+            continue
+
         quantity = 1
 
-        # Contoh:
+        # Example:
         # Roti x2 15000
         x_quantity = re.search(
             r"\b[xX]\s*(\d+)\b",
@@ -654,7 +702,7 @@ def extract_items(text):
 
         else:
 
-            # Contoh:
+            # Example:
             # 2 Roti 15000
             numeric_quantity = re.match(
                 r"^(\d+)\s+(.+)$",
@@ -667,9 +715,15 @@ def extract_items(text):
                     numeric_quantity.group(1)
                 )
 
-                if 1 <= possible_quantity <= 50:
+                if (
+                    1
+                    <= possible_quantity
+                    <= 50
+                ):
 
-                    quantity = possible_quantity
+                    quantity = (
+                        possible_quantity
+                    )
 
                     item_name = (
                         numeric_quantity.group(2)
@@ -730,6 +784,7 @@ def parse_receipt(text):
             "grand total",
             "total",
             "jumlah",
+            "amount due",
         ],
     )
 
@@ -737,6 +792,7 @@ def parse_receipt(text):
         text
     )
 
+    # Calculate subtotal from items
     if subtotal == 0:
 
         subtotal = sum(
@@ -744,6 +800,8 @@ def parse_receipt(text):
             for item in items
         )
 
+    # Calculate total if OCR
+    # did not find total
     if total == 0:
 
         total = (
@@ -802,7 +860,10 @@ def upload_to_drive(
             body=metadata,
             media_body=media,
             fields=(
-                "id,name,mimeType,webViewLink"
+                "id,"
+                "name,"
+                "mimeType,"
+                "webViewLink"
             ),
             supportsAllDrives=True,
         )
@@ -824,7 +885,7 @@ def upload_to_drive(
 
 
 # ============================================================
-# CREATE GOOGLE SHEETS HEADER
+# GOOGLE SHEETS HEADER
 # ============================================================
 
 def ensure_sheet_header():
@@ -844,7 +905,7 @@ def ensure_sheet_header():
 
 
 # ============================================================
-# SAVE RECEIPT
+# SAVE RECEIPT TO SHEETS
 # ============================================================
 
 def save_receipt_to_sheet(
@@ -935,18 +996,67 @@ def load_receipts():
 
 
 # ============================================================
+# CONNECTION TEST
+# ============================================================
+
+def test_google_connections():
+
+    info = get_service_account_info()
+
+    results = {
+        "project_id": info.get(
+            "project_id",
+            "",
+        ),
+        "client_email": info.get(
+            "client_email",
+            "",
+        ),
+        "sheets": False,
+        "drive": False,
+        "tesseract": False,
+    }
+
+    # Google Sheets
+    worksheet = get_worksheet()
+
+    if worksheet:
+
+        results["sheets"] = True
+
+    # Google Drive
+    get_drive_service()
+
+    results["drive"] = True
+
+    # Tesseract
+    languages = pytesseract.get_languages(
+        config=""
+    )
+
+    if languages:
+
+        results["tesseract"] = True
+
+    results["ocr_languages"] = languages
+
+    return results
+
+
+# ============================================================
 # CONNECTION TEST PAGE
 # ============================================================
 
 def show_connection_test():
 
     st.header(
-        "🔧 Google Connection Test"
+        "🔧 Connection Test"
     )
 
     st.write(
-        "Periksa Google Vision, Google Sheets, "
-        "dan Google Drive."
+        "Halaman ini digunakan untuk memastikan "
+        "Google Sheets, Google Drive, dan Tesseract "
+        "sudah berjalan."
     )
 
     if st.button(
@@ -974,12 +1084,6 @@ def show_connection_test():
                 f"`{results['client_email']}`"
             )
 
-            if results["vision"]:
-
-                st.success(
-                    "✅ Google Vision berhasil."
-                )
-
             if results["sheets"]:
 
                 st.success(
@@ -992,6 +1096,21 @@ def show_connection_test():
                     "✅ Google Drive berhasil."
                 )
 
+            if results["tesseract"]:
+
+                st.success(
+                    "✅ Tesseract OCR berhasil."
+                )
+
+                languages = results[
+                    "ocr_languages"
+                ]
+
+                st.write(
+                    "**OCR Languages:** "
+                    + ", ".join(languages)
+                )
+
         except Exception as exc:
 
             st.error(
@@ -999,11 +1118,6 @@ def show_connection_test():
             )
 
             st.exception(exc)
-
-            st.info(
-                "Pastikan API aktif, Spreadsheet dibagikan "
-                "ke Service Account, dan Spreadsheet ID benar."
-            )
 
 
 # ============================================================
@@ -1025,8 +1139,8 @@ def show_upload_page():
             "webp",
         ],
         help=(
-            "Gunakan foto receipt yang jelas, "
-            "tidak blur, dan seluruh struk terlihat."
+            "Gunakan foto receipt yang jelas "
+            "dan tidak blur."
         ),
     )
 
@@ -1065,7 +1179,7 @@ def show_upload_page():
             try:
 
                 with st.spinner(
-                    "Google Vision sedang membaca receipt..."
+                    "Tesseract sedang membaca receipt..."
                 ):
 
                     ocr_text = perform_ocr(
@@ -1075,7 +1189,8 @@ def show_upload_page():
                 if not ocr_text:
 
                     st.warning(
-                        "OCR tidak menemukan teks."
+                        "Tesseract tidak menemukan teks "
+                        "pada foto."
                     )
 
                     st.session_state.ocr_completed = (
@@ -1111,8 +1226,8 @@ def show_upload_page():
                 st.exception(exc)
 
                 st.info(
-                    "Jika muncul error 401, periksa "
-                    "Cloud Vision API dan Service Account."
+                    "Pastikan Tesseract sudah terinstall "
+                    "melalui packages.txt."
                 )
 
     show_review_section()
@@ -1394,7 +1509,7 @@ def show_review_section():
         )
 
     # ========================================================
-    # RAW OCR
+    # OCR RAW TEXT
     # ========================================================
 
     with st.expander(
@@ -1458,26 +1573,28 @@ def show_review_section():
         try:
 
             # ------------------------------------------------
-            # Upload foto
+            # Upload photo
             # ------------------------------------------------
 
             with st.spinner(
                 "1/2 Upload foto ke Google Drive..."
             ):
 
-                drive_result = upload_to_drive(
-                    image_bytes=(
-                        st.session_state.image_bytes
-                    ),
-                    filename=(
-                        receipt_id
-                        + "_"
-                        + st.session_state.image_name
-                    ),
-                    mime_type=(
-                        st.session_state.mime_type
-                        or "image/jpeg"
-                    ),
+                drive_result = (
+                    upload_to_drive(
+                        image_bytes=(
+                            st.session_state.image_bytes
+                        ),
+                        filename=(
+                            receipt_id
+                            + "_"
+                            + st.session_state.image_name
+                        ),
+                        mime_type=(
+                            st.session_state.mime_type
+                            or "image/jpeg"
+                        ),
+                    )
                 )
 
             # ------------------------------------------------
@@ -1515,7 +1632,7 @@ def show_review_section():
             )
 
             st.markdown(
-                f"[📷 Buka foto receipt di Google Drive]"
+                "[📷 Buka foto receipt di Google Drive]"
                 f"({drive_result['url']})"
             )
 
@@ -1611,9 +1728,9 @@ def show_history_page():
         ]
 
         available_columns = [
-            col
-            for col in display_columns
-            if col in filtered_df.columns
+            column
+            for column in display_columns
+            if column in filtered_df.columns
         ]
 
         st.dataframe(
@@ -1634,7 +1751,7 @@ def show_history_page():
 
 
 # ============================================================
-# DASHBOARD PAGE
+# DASHBOARD
 # ============================================================
 
 def show_dashboard_page():
@@ -1660,8 +1777,6 @@ def show_dashboard_page():
             errors="coerce",
         )
 
-        # Satu receipt bisa memiliki
-        # beberapa item/baris.
         receipt_summary = (
             df.groupby(
                 "Receipt_ID",
@@ -1738,12 +1853,12 @@ def main():
     )
 
     st.caption(
-        "Foto Receipt → OCR → Review → "
+        "Foto Receipt → Tesseract OCR → Review → "
         "Google Drive + Google Sheets"
     )
 
     # --------------------------------------------------------
-    # Ensure Sheet
+    # Prepare Sheets
     # --------------------------------------------------------
 
     try:
@@ -1759,12 +1874,9 @@ def main():
         st.exception(exc)
 
         st.info(
-            "Periksa kembali:\n"
-            "1. Spreadsheet ID\n"
-            "2. Service Account\n"
-            "3. Google Sheets API\n"
-            "4. Google Drive API\n"
-            "5. Permission Editor pada spreadsheet"
+            "Periksa Spreadsheet ID, "
+            "Service Account, permission Editor, "
+            "dan Google Sheets API."
         )
 
     # --------------------------------------------------------
@@ -1801,10 +1913,6 @@ def main():
 
         show_connection_test()
 
-
-# ============================================================
-# RUN
-# ============================================================
 
 if __name__ == "__main__":
     main()
