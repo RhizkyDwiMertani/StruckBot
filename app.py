@@ -3,19 +3,18 @@ import re
 import uuid
 from datetime import date, datetime
 
+import gspread
 import pandas as pd
 import streamlit as st
-import gspread
-
-from google.oauth2.service_account import Credentials
 from google.cloud import vision
+from google.oauth2.service_account import Credentials
 from googleapiclient.discovery import build
 from googleapiclient.http import MediaIoBaseUpload
 
 
-# ============================================================
-# PAGE CONFIG
-# ============================================================
+# =========================================================
+# APP CONFIG
+# =========================================================
 
 st.set_page_config(
     page_title="Receipt Tracker",
@@ -23,266 +22,221 @@ st.set_page_config(
     layout="wide",
 )
 
-
-# ============================================================
-# CONFIGURATION
-# ============================================================
-
 SPREADSHEET_NAME = "Receipt Tracker"
 WORKSHEET_NAME = "Receipts"
 
-# Google Sheets
 SHEETS_SCOPES = [
     "https://www.googleapis.com/auth/spreadsheets",
 ]
 
-# Google Drive
 DRIVE_SCOPES = [
     "https://www.googleapis.com/auth/drive",
 ]
 
-# Google Cloud Vision
 VISION_SCOPES = [
     "https://www.googleapis.com/auth/cloud-platform",
 ]
 
+EXPECTED_HEADERS = [
+    "Receipt_ID",
+    "Tanggal",
+    "Toko",
+    "Kategori",
+    "Item",
+    "Qty",
+    "Harga",
+    "Subtotal_Item",
+    "Subtotal_Receipt",
+    "Pajak",
+    "Diskon",
+    "Total",
+    "Metode_Pembayaran",
+    "Catatan",
+    "Foto_URL",
+    "Created_At",
+    "OCR_Text",
+]
 
-# ============================================================
+
+# =========================================================
 # SESSION STATE
-# ============================================================
+# =========================================================
 
-DEFAULT_SESSION_STATE = {
-    "ocr_text": "",
-    "receipt_data": None,
-    "image_bytes": None,
-    "image_name": None,
-    "mime_type": None,
-    "ocr_completed": False,
-}
+def init_session_state():
+    defaults = {
+        "ocr_text": "",
+        "receipt_data": None,
+        "image_bytes": None,
+        "image_name": None,
+        "mime_type": None,
+        "ocr_completed": False,
+    }
 
-for key, value in DEFAULT_SESSION_STATE.items():
+    for key, value in defaults.items():
+        if key not in st.session_state:
+            st.session_state[key] = value
 
-    if key not in st.session_state:
-        st.session_state[key] = value
+
+def clear_receipt_state():
+    st.session_state.ocr_text = ""
+    st.session_state.receipt_data = None
+    st.session_state.image_bytes = None
+    st.session_state.image_name = None
+    st.session_state.mime_type = None
+    st.session_state.ocr_completed = False
 
 
-# ============================================================
-# GOOGLE CREDENTIALS
-# ============================================================
+init_session_state()
 
-def load_service_account_info():
-    """
-    Read Google Service Account information
-    from Streamlit Secrets.
-    """
 
+# =========================================================
+# GOOGLE AUTHENTICATION
+# =========================================================
+
+def get_service_account_info():
     if "google_service_account" not in st.secrets:
-
         raise RuntimeError(
             "Secret [google_service_account] tidak ditemukan. "
-            "Pastikan secrets.toml telah dikonfigurasi."
+            "Tambahkan credential di Streamlit Secrets."
         )
 
-    return dict(
-        st.secrets["google_service_account"]
-    )
+    return dict(st.secrets["google_service_account"])
 
 
-def create_credentials(scopes):
-    """
-    Create Google credentials with specific scopes.
-    """
+def get_credentials(scopes):
+    info = get_service_account_info()
 
-    service_account_info = (
-        load_service_account_info()
-    )
+    required_fields = [
+        "type",
+        "project_id",
+        "private_key",
+        "client_email",
+    ]
 
-    credentials = (
-        Credentials.from_service_account_info(
-            service_account_info,
+    missing = [
+        field
+        for field in required_fields
+        if not info.get(field)
+    ]
+
+    if missing:
+        raise RuntimeError(
+            "Field credential yang belum ada: "
+            + ", ".join(missing)
+        )
+
+    try:
+        return Credentials.from_service_account_info(
+            info,
             scopes=scopes,
         )
-    )
+    except Exception as exc:
+        raise RuntimeError(
+            "Gagal membuat Google credentials. "
+            "Periksa private_key dan isi Secrets."
+        ) from exc
 
-    return credentials
 
-
-# ============================================================
-# GOOGLE CLOUD VISION
-# ============================================================
+# =========================================================
+# GOOGLE CLIENTS
+# =========================================================
 
 @st.cache_resource
 def get_vision_client():
+    credentials = get_credentials(VISION_SCOPES)
 
-    credentials = create_credentials(
-        VISION_SCOPES
-    )
-
-    client = vision.ImageAnnotatorClient(
+    return vision.ImageAnnotatorClient(
         credentials=credentials
     )
 
-    return client
-
-
-# ============================================================
-# GOOGLE SHEETS
-# ============================================================
 
 @st.cache_resource
 def get_sheet_client():
+    credentials = get_credentials(SHEETS_SCOPES)
 
-    credentials = create_credentials(
-        SHEETS_SCOPES
-    )
-
-    client = gspread.authorize(
-        credentials
-    )
-
-    return client
+    return gspread.authorize(credentials)
 
 
 @st.cache_resource
 def get_worksheet():
-
     client = get_sheet_client()
 
-    spreadsheet = client.open(
-        SPREADSHEET_NAME
-    )
-
-    worksheet = spreadsheet.worksheet(
-        WORKSHEET_NAME
-    )
+    spreadsheet = client.open(SPREADSHEET_NAME)
+    worksheet = spreadsheet.worksheet(WORKSHEET_NAME)
 
     return worksheet
 
 
-# ============================================================
-# GOOGLE DRIVE
-# ============================================================
-
 @st.cache_resource
 def get_drive_service():
+    credentials = get_credentials(DRIVE_SCOPES)
 
-    credentials = create_credentials(
-        DRIVE_SCOPES
-    )
-
-    service = build(
+    return build(
         "drive",
         "v3",
         credentials=credentials,
+        cache_discovery=False,
     )
 
-    return service
 
+# =========================================================
+# GOOGLE SERVICE TEST
+# =========================================================
 
-# ============================================================
-# TEST GOOGLE SERVICES
-# ============================================================
+def test_google_services():
+    info = get_service_account_info()
 
-def test_vision_credentials():
-    """
-    Returns the service account email and project ID
-    without exposing private credentials.
-    """
-
-    info = load_service_account_info()
-
-    required = [
-        "project_id",
-        "client_email",
-        "private_key",
-    ]
-
-    missing = [
-        key
-        for key in required
-        if not info.get(key)
-    ]
-
-    if missing:
-
-        raise RuntimeError(
-            "Field credential berikut belum ada: "
-            + ", ".join(missing)
-        )
-
-    # Create credentials to verify key format.
-    credentials = create_credentials(
-        VISION_SCOPES
-    )
-
-    if not credentials.valid:
-        raise RuntimeError(
-            "Credential Google tidak valid."
-        )
-
-    return {
-        "project_id": info["project_id"],
-        "client_email": info["client_email"],
+    results = {
+        "project_id": info.get("project_id", ""),
+        "client_email": info.get("client_email", ""),
+        "vision": False,
+        "sheets": False,
+        "drive": False,
     }
 
+    get_vision_client()
+    results["vision"] = True
 
-# ============================================================
-# OCR
-# ============================================================
+    worksheet = get_worksheet()
+    results["sheets"] = worksheet is not None
+
+    get_drive_service()
+    results["drive"] = True
+
+    return results
+
+
+# =========================================================
+# GOOGLE VISION OCR
+# =========================================================
 
 def perform_ocr(image_bytes):
-    """
-    Perform Google Cloud Vision OCR.
-    """
-
     client = get_vision_client()
 
-    image = vision.Image(
-        content=image_bytes
-    )
+    image = vision.Image(content=image_bytes)
 
     response = client.document_text_detection(
         image=image
     )
 
-    # API-level error
     if response.error.message:
-
         raise RuntimeError(
-            f"Google Vision API error: "
-            f"{response.error.message}"
+            f"Google Vision API error: {response.error.message}"
         )
 
-    # No OCR text
-    if (
-        not response.full_text_annotation
-        or not response.full_text_annotation.text
-    ):
+    text = ""
 
-        return ""
+    if response.full_text_annotation:
+        text = response.full_text_annotation.text or ""
 
-    return (
-        response.full_text_annotation.text
-        .strip()
-    )
+    return text.strip()
 
 
-# ============================================================
-# NUMBER PARSER
-# ============================================================
+# =========================================================
+# HELPERS
+# =========================================================
 
 def parse_amount(value):
-    """
-    Convert:
-        Rp 25.000
-        25.000
-        Rp25,000
-        25,000
-        25000
-
-    into integer.
-    """
-
     if value is None:
         return 0
 
@@ -291,11 +245,7 @@ def parse_amount(value):
     if not text:
         return 0
 
-    digits = re.sub(
-        r"[^0-9]",
-        "",
-        text,
-    )
+    digits = re.sub(r"[^0-9]", "", text)
 
     if not digits:
         return 0
@@ -303,66 +253,30 @@ def parse_amount(value):
     return int(digits)
 
 
-# ============================================================
-# DATE EXTRACTION
-# ============================================================
-
 def extract_date(text):
-
     patterns = [
-
-        # 24/08/2026
-        r"\b(\d{1,2})[/\-](\d{1,2})[/\-](\d{2,4})\b",
-
-        # 24 08 2026
+        r"\b(\d{1,2})[\/\-](\d{1,2})[\/\-](\d{2,4})\b",
         r"\b(\d{1,2})\s+(\d{1,2})\s+(\d{2,4})\b",
     ]
 
     for pattern in patterns:
-
-        matches = re.finditer(
-            pattern,
-            text,
-        )
-
-        for match in matches:
-
+        for match in re.finditer(pattern, text):
             try:
-
-                day = int(
-                    match.group(1)
-                )
-
-                month = int(
-                    match.group(2)
-                )
-
-                year = int(
-                    match.group(3)
-                )
+                day = int(match.group(1))
+                month = int(match.group(2))
+                year = int(match.group(3))
 
                 if year < 100:
                     year += 2000
 
-                return date(
-                    year,
-                    month,
-                    day,
-                )
-
+                return date(year, month, day)
             except ValueError:
-
                 continue
 
     return date.today()
 
 
-# ============================================================
-# STORE EXTRACTION
-# ============================================================
-
 def extract_store(text):
-
     lines = [
         line.strip()
         for line in text.splitlines()
@@ -386,30 +300,18 @@ def extract_store(text):
         "phone",
     ]
 
-    # Usually merchant name appears
-    # near the top of a receipt.
     for line in lines[:10]:
-
         lower = line.lower()
 
         if len(line) < 3:
             continue
 
-        if any(
-            word in lower
-            for word in ignored
-        ):
+        if any(word in lower for word in ignored):
             continue
 
-        # Ignore lines dominated by numbers
-        number_count = len(
-            re.findall(
-                r"\d",
-                line
-            )
-        )
+        digit_count = len(re.findall(r"\d", line))
 
-        if number_count >= 3:
+        if digit_count >= 3:
             continue
 
         return line
@@ -417,54 +319,27 @@ def extract_store(text):
     return lines[0]
 
 
-# ============================================================
-# AMOUNT EXTRACTION FROM KEYWORD
-# ============================================================
-
-def extract_amount_by_keyword(
-    text,
-    keywords,
-):
-
+def extract_amount_by_keyword(text, keywords):
     for line in text.splitlines():
-
         lower = line.lower()
 
-        if not any(
-            keyword in lower
-            for keyword in keywords
-        ):
+        if not any(keyword in lower for keyword in keywords):
             continue
 
-        # Find amounts on line
         matches = re.findall(
             r"(?:rp\.?\s*)?([\d.,]+)",
             line,
             flags=re.IGNORECASE,
         )
 
-        if not matches:
-            continue
-
-        # Last numeric value is normally amount.
-        return parse_amount(
-            matches[-1]
-        )
+        if matches:
+            return parse_amount(matches[-1])
 
     return 0
 
 
-# ============================================================
-# ITEM EXTRACTION
-# ============================================================
-
 def extract_items(text):
-
-    lines = text.splitlines()
-
-    items = []
-
-    excluded_keywords = [
+    excluded = [
         "total",
         "subtotal",
         "sub total",
@@ -494,8 +369,9 @@ def extract_items(text):
         "thank",
     ]
 
-    for raw_line in lines:
+    items = []
 
+    for raw_line in text.splitlines():
         line = raw_line.strip()
 
         if not line:
@@ -503,14 +379,9 @@ def extract_items(text):
 
         lower = line.lower()
 
-        # Skip obvious non-item lines.
-        if any(
-            keyword in lower
-            for keyword in excluded_keywords
-        ):
+        if any(word in lower for word in excluded):
             continue
 
-        # Price at the end of line.
         price_match = re.search(
             r"(?:rp\.?\s*)?([\d.,]+)\s*$",
             line,
@@ -520,65 +391,42 @@ def extract_items(text):
         if not price_match:
             continue
 
-        price = parse_amount(
-            price_match.group(1)
-        )
+        price = parse_amount(price_match.group(1))
 
         if price <= 0:
             continue
 
-        item_name = (
-            line[:price_match.start()]
-            .strip()
-        )
+        item_name = line[:price_match.start()].strip()
 
         if len(item_name) < 2:
             continue
 
         qty = 1
 
-        # Example:
-        # Roti x2 15000
-        x_qty_match = re.search(
+        x_qty = re.search(
             r"\b[xX]\s*(\d+)\b",
             item_name,
         )
 
-        if x_qty_match:
-
-            qty = int(
-                x_qty_match.group(1)
-            )
-
+        if x_qty:
+            qty = int(x_qty.group(1))
             item_name = re.sub(
                 r"\b[xX]\s*\d+\b",
                 "",
                 item_name,
             ).strip()
-
         else:
-
-            # Example:
-            # 2 Roti 15000
-            numeric_qty_match = re.match(
+            numeric_qty = re.match(
                 r"^(\d+)\s+(.+)$",
                 item_name,
             )
 
-            if numeric_qty_match:
-
-                possible_qty = int(
-                    numeric_qty_match.group(1)
-                )
+            if numeric_qty:
+                possible_qty = int(numeric_qty.group(1))
 
                 if 1 <= possible_qty <= 50:
-
                     qty = possible_qty
-
-                    item_name = (
-                        numeric_qty_match.group(2)
-                        .strip()
-                    )
+                    item_name = numeric_qty.group(2).strip()
 
         if not item_name:
             continue
@@ -595,78 +443,41 @@ def extract_items(text):
     return items
 
 
-# ============================================================
-# PARSE OCR RESULT
-# ============================================================
-
 def parse_receipt(text):
-
-    transaction_date = extract_date(
-        text
-    )
-
-    store = extract_store(
-        text
-    )
-
     subtotal = extract_amount_by_keyword(
         text,
-        [
-            "subtotal",
-            "sub total",
-        ],
+        ["subtotal", "sub total"],
     )
 
     tax = extract_amount_by_keyword(
         text,
-        [
-            "tax",
-            "pajak",
-            "ppn",
-        ],
+        ["tax", "pajak", "ppn"],
     )
 
     discount = extract_amount_by_keyword(
         text,
-        [
-            "discount",
-            "diskon",
-        ],
+        ["discount", "diskon"],
     )
 
     total = extract_amount_by_keyword(
         text,
-        [
-            "grand total",
-            "total",
-            "jumlah",
-        ],
+        ["grand total", "total", "jumlah"],
     )
 
-    items = extract_items(
-        text
-    )
+    items = extract_items(text)
 
-    # Calculate subtotal if OCR did not find one.
     if subtotal == 0:
-
         subtotal = sum(
             item["subtotal"]
             for item in items
         )
 
-    # Calculate total if OCR did not find one.
     if total == 0:
-
-        total = (
-            subtotal
-            + tax
-            - discount
-        )
+        total = subtotal + tax - discount
 
     return {
-        "date": transaction_date,
-        "store": store,
+        "date": extract_date(text),
+        "store": extract_store(text),
         "subtotal": subtotal,
         "tax": tax,
         "discount": discount,
@@ -675,59 +486,39 @@ def parse_receipt(text):
     }
 
 
-# ============================================================
-# GOOGLE DRIVE FOLDER
-# ============================================================
+# =========================================================
+# GOOGLE DRIVE
+# =========================================================
 
 def get_drive_folder_id():
-
-    folder_id = st.secrets.get(
-        "google_drive_folder_id",
-        "",
-    )
-
-    if not folder_id:
-        return None
-
-    return str(folder_id).strip()
+    return str(
+        st.secrets.get(
+            "google_drive_folder_id",
+            ""
+        )
+    ).strip()
 
 
-# ============================================================
-# UPLOAD PHOTO TO GOOGLE DRIVE
-# ============================================================
-
-def upload_to_drive(
-    image_bytes,
-    filename,
-    mime_type,
-):
-
-    drive_service = (
-        get_drive_service()
-    )
+def upload_to_drive(image_bytes, filename, mime_type):
+    service = get_drive_service()
 
     metadata = {
         "name": filename,
     }
 
-    folder_id = (
-        get_drive_folder_id()
-    )
+    folder_id = get_drive_folder_id()
 
     if folder_id:
-
-        metadata["parents"] = [
-            folder_id
-        ]
+        metadata["parents"] = [folder_id]
 
     media = MediaIoBaseUpload(
         io.BytesIO(image_bytes),
-        mimetype=mime_type,
+        mimetype=mime_type or "image/jpeg",
         resumable=False,
     )
 
     uploaded = (
-        drive_service.files()
+        service.files()
         .create(
             body=metadata,
             media_body=media,
@@ -747,55 +538,25 @@ def upload_to_drive(
     return {
         "id": file_id,
         "name": uploaded["name"],
-        "mime_type": uploaded["mimeType"],
         "url": file_url,
     }
 
 
-# ============================================================
-# GOOGLE SHEETS HEADER
-# ============================================================
-
-EXPECTED_HEADERS = [
-    "Receipt_ID",
-    "Tanggal",
-    "Toko",
-    "Kategori",
-    "Item",
-    "Qty",
-    "Harga",
-    "Subtotal_Item",
-    "Subtotal_Receipt",
-    "Pajak",
-    "Diskon",
-    "Total",
-    "Metode_Pembayaran",
-    "Catatan",
-    "Foto_URL",
-    "Created_At",
-    "OCR_Text",
-]
-
+# =========================================================
+# GOOGLE SHEETS
+# =========================================================
 
 def ensure_sheet_header():
-
     worksheet = get_worksheet()
 
-    current_headers = (
-        worksheet.row_values(1)
-    )
+    current_headers = worksheet.row_values(1)
 
     if current_headers != EXPECTED_HEADERS:
-
         worksheet.update(
             "A1:Q1",
             [EXPECTED_HEADERS],
         )
 
-
-# ============================================================
-# SAVE RECEIPT TO GOOGLE SHEETS
-# ============================================================
 
 def save_receipt_to_sheet(
     receipt_data,
@@ -806,19 +567,15 @@ def save_receipt_to_sheet(
     note,
     ocr_text,
 ):
-
     worksheet = get_worksheet()
 
     created_at = datetime.now().strftime(
         "%Y-%m-%d %H:%M:%S"
     )
 
-    items = receipt_data["items"]
+    items = receipt_data.get("items", [])
 
-    # Keep receipt even if OCR did not detect
-    # item-level information.
     if not items:
-
         items = [
             {
                 "item": "",
@@ -831,7 +588,6 @@ def save_receipt_to_sheet(
     rows = []
 
     for item in items:
-
         rows.append(
             [
                 receipt_id,
@@ -860,225 +616,83 @@ def save_receipt_to_sheet(
     )
 
 
-# ============================================================
-# LOAD RECEIPTS
-# ============================================================
-
 def load_receipts():
-
     worksheet = get_worksheet()
 
-    records = (
-        worksheet.get_all_records()
-    )
+    records = worksheet.get_all_records()
 
     if not records:
         return pd.DataFrame()
 
-    return pd.DataFrame(
-        records
-    )
+    return pd.DataFrame(records)
 
 
-# ============================================================
-# CLEAR CURRENT RECEIPT
-# ============================================================
+# =========================================================
+# UI - CONNECTION TEST
+# =========================================================
 
-def clear_current_receipt():
-
-    st.session_state.ocr_text = ""
-    st.session_state.receipt_data = None
-    st.session_state.image_bytes = None
-    st.session_state.image_name = None
-    st.session_state.mime_type = None
-    st.session_state.ocr_completed = False
-
-
-# ============================================================
-# APP TITLE
-# ============================================================
-
-st.title("🧾 Receipt Tracker")
-
-st.caption(
-    "Foto Receipt → OCR → Review → Google Drive + Google Sheets"
-)
-
-
-# ============================================================
-# SIDEBAR
-# ============================================================
-
-page = st.sidebar.radio(
-    "Menu",
-    [
-        "Upload Receipt",
-        "Riwayat",
-        "Dashboard",
-        "Connection Test",
-    ],
-)
-
-
-# ============================================================
-# CONNECTION TEST PAGE
-# ============================================================
-
-if page == "Connection Test":
-
-    st.header(
-        "🔧 Google Connection Test"
-    )
+def show_connection_test():
+    st.header("🔧 Connection Test")
 
     st.write(
-        "Gunakan halaman ini untuk memastikan "
-        "credential Google sudah benar."
+        "Gunakan halaman ini untuk mengecek "
+        "Google Vision, Google Sheets, dan Google Drive."
     )
 
     if st.button(
-        "Test Credentials"
+        "Test Semua Koneksi",
+        type="primary",
     ):
-
-        # -----------------------------------------------
-        # Vision credentials
-        # -----------------------------------------------
-
         try:
+            results = test_google_services()
 
-            info = test_vision_credentials()
-
-            st.success(
-                "✅ Credential Google valid."
-            )
+            st.success("Credential berhasil dibaca.")
 
             st.write(
-                f"**Project ID:** "
-                f"`{info['project_id']}`"
+                f"**Project ID:** `{results['project_id']}`"
             )
 
             st.write(
                 f"**Service Account:** "
-                f"`{info['client_email']}`"
+                f"`{results['client_email']}`"
             )
 
-        except Exception as e:
+            st.success("✅ Google Vision berhasil.")
+            st.success("✅ Google Sheets berhasil.")
+            st.success("✅ Google Drive berhasil.")
 
-            st.error(
-                "❌ Credential test gagal."
+        except Exception as exc:
+            st.error("❌ Connection test gagal.")
+            st.exception(exc)
+
+            st.info(
+                "Periksa Cloud Vision API, Google Sheets API, "
+                "Google Drive API, Service Account, dan Streamlit Secrets."
             )
 
-            st.exception(e)
 
+# =========================================================
+# UI - UPLOAD
+# =========================================================
 
-        # -----------------------------------------------
-        # Vision client
-        # -----------------------------------------------
-
-        try:
-
-            get_vision_client()
-
-            st.success(
-                "✅ Google Vision client berhasil dibuat."
-            )
-
-        except Exception as e:
-
-            st.error(
-                "❌ Google Vision client gagal dibuat."
-            )
-
-            st.exception(e)
-
-
-        # -----------------------------------------------
-        # Sheets
-        # -----------------------------------------------
-
-        try:
-
-            worksheet = get_worksheet()
-
-            st.success(
-                "✅ Google Sheets berhasil diakses."
-            )
-
-            st.write(
-                f"Worksheet: `{worksheet.title}`"
-            )
-
-        except Exception as e:
-
-            st.error(
-                "❌ Google Sheets gagal diakses."
-            )
-
-            st.exception(e)
-
-
-        # -----------------------------------------------
-        # Drive
-        # -----------------------------------------------
-
-        try:
-
-            get_drive_service()
-
-            st.success(
-                "✅ Google Drive service berhasil dibuat."
-            )
-
-        except Exception as e:
-
-            st.error(
-                "❌ Google Drive gagal diakses."
-            )
-
-            st.exception(e)
-
-
-# ============================================================
-# UPLOAD RECEIPT
-# ============================================================
-
-elif page == "Upload Receipt":
-
-    st.header(
-        "📷 Upload Receipt"
-    )
+def show_upload_page():
+    st.header("📷 Upload Receipt")
 
     uploaded_file = st.file_uploader(
         "Pilih foto receipt",
-        type=[
-            "jpg",
-            "jpeg",
-            "png",
-            "webp",
-        ],
+        type=["jpg", "jpeg", "png", "webp"],
         help=(
             "Gunakan foto yang jelas, tidak blur, "
             "dan seluruh receipt terlihat."
         ),
     )
 
-    if uploaded_file:
+    if uploaded_file is not None:
+        image_bytes = uploaded_file.getvalue()
 
-        image_bytes = (
-            uploaded_file.getvalue()
-        )
-
-        # Save uploaded image to session.
-        st.session_state.image_bytes = (
-            image_bytes
-        )
-
-        st.session_state.image_name = (
-            uploaded_file.name
-        )
-
-        st.session_state.mime_type = (
-            uploaded_file.type
-        )
+        st.session_state.image_bytes = image_bytes
+        st.session_state.image_name = uploaded_file.name
+        st.session_state.mime_type = uploaded_file.type
 
         st.image(
             image_bytes,
@@ -1093,679 +707,532 @@ elif page == "Upload Receipt":
             type="primary",
             use_container_width=True,
         ):
-
             try:
-
                 with st.spinner(
                     "Google Vision sedang membaca receipt..."
                 ):
-
-                    ocr_text = perform_ocr(
-                        image_bytes
-                    )
+                    ocr_text = perform_ocr(image_bytes)
 
                 if not ocr_text:
-
                     st.warning(
-                        "Tidak ada teks yang berhasil dibaca."
+                        "OCR tidak menemukan teks pada foto."
                     )
+                    return
 
-                    st.session_state.ocr_completed = (
-                        False
-                    )
+                st.session_state.ocr_text = ocr_text
+                st.session_state.receipt_data = parse_receipt(
+                    ocr_text
+                )
+                st.session_state.ocr_completed = True
 
-                else:
+                st.success("✅ OCR berhasil.")
 
-                    parsed_data = parse_receipt(
-                        ocr_text
-                    )
+            except Exception as exc:
+                st.error("❌ OCR gagal.")
+                st.exception(exc)
 
-                    st.session_state.ocr_text = (
-                        ocr_text
-                    )
-
-                    st.session_state.receipt_data = (
-                        parsed_data
-                    )
-
-                    st.session_state.ocr_completed = (
-                        True
-                    )
-
-                    st.success(
-                        "✅ OCR berhasil."
-                    )
-
-            except Exception as e:
-
-                st.error(
-                    "❌ OCR gagal."
+                st.warning(
+                    "Jika error menunjukkan 401 authentication, "
+                    "buka menu Connection Test."
                 )
 
-                st.exception(e)
-
-                st.info(
-                    "Jika error menunjukkan 401 "
-                    "'invalid authentication credentials', "
-                    "buka menu Connection Test untuk diagnosis."
-                )
+    show_review_section()
 
 
-    # ========================================================
-    # REVIEW RECEIPT
-    # ========================================================
+# =========================================================
+# UI - REVIEW
+# =========================================================
 
-    if st.session_state.receipt_data:
+def show_review_section():
+    if not st.session_state.receipt_data:
+        return
 
-        st.divider()
+    st.divider()
+    st.header("✏️ Review Hasil OCR")
 
-        st.header(
-            "✏️ Review Hasil OCR"
+    receipt = st.session_state.receipt_data
+
+    col1, col2 = st.columns(2)
+
+    with col1:
+        store = st.text_input(
+            "Nama Toko",
+            value=receipt["store"],
         )
 
-        receipt = (
-            st.session_state.receipt_data
+    with col2:
+        transaction_date = st.date_input(
+            "Tanggal",
+            value=receipt["date"],
         )
 
-        # -----------------------------------------------
-        # STORE & DATE
-        # -----------------------------------------------
+    col1, col2 = st.columns(2)
 
-        col1, col2 = st.columns(2)
-
-        with col1:
-
-            store = st.text_input(
-                "Nama Toko",
-                value=receipt["store"],
-                key="review_store",
-            )
-
-        with col2:
-
-            transaction_date = st.date_input(
-                "Tanggal",
-                value=receipt["date"],
-                key="review_date",
-            )
-
-
-        # -----------------------------------------------
-        # CATEGORY & PAYMENT
-        # -----------------------------------------------
-
-        col1, col2 = st.columns(2)
-
-        with col1:
-
-            category = st.selectbox(
-                "Kategori",
-                [
-                    "Food",
-                    "Transportation",
-                    "Shopping",
-                    "Bills",
-                    "Entertainment",
-                    "Health",
-                    "Education",
-                    "Other",
-                ],
-                key="review_category",
-            )
-
-        with col2:
-
-            payment_method = st.selectbox(
-                "Metode Pembayaran",
-                [
-                    "Cash",
-                    "Debit",
-                    "Credit Card",
-                    "E-Wallet",
-                    "Bank Transfer",
-                    "QRIS",
-                    "Other",
-                ],
-                key="review_payment",
-            )
-
-
-        # -----------------------------------------------
-        # ITEMS
-        # -----------------------------------------------
-
-        st.subheader(
-            "Daftar Item"
+    with col1:
+        category = st.selectbox(
+            "Kategori",
+            [
+                "Food",
+                "Transportation",
+                "Shopping",
+                "Bills",
+                "Entertainment",
+                "Health",
+                "Education",
+                "Other",
+            ],
         )
 
-        original_items = (
-            receipt.get("items", [])
+    with col2:
+        payment_method = st.selectbox(
+            "Metode Pembayaran",
+            [
+                "Cash",
+                "Debit",
+                "Credit Card",
+                "E-Wallet",
+                "Bank Transfer",
+                "QRIS",
+                "Other",
+            ],
         )
 
-        if not original_items:
+    st.subheader("Daftar Item")
 
-            original_items = [
-                {
-                    "item": "",
-                    "qty": 1,
-                    "price": 0,
-                    "subtotal": 0,
-                }
-            ]
-
-        edited_items = []
-
-        for index, item in enumerate(
-            original_items
-        ):
-
-            col1, col2, col3 = st.columns(
-                [4, 1, 2]
-            )
-
-            with col1:
-
-                item_name = st.text_input(
-                    f"Item {index + 1}",
-                    value=item["item"],
-                    key=f"review_item_{index}",
-                )
-
-            with col2:
-
-                qty = st.number_input(
-                    "Qty",
-                    min_value=1,
-                    value=int(
-                        item["qty"]
-                    ),
-                    step=1,
-                    key=f"review_qty_{index}",
-                )
-
-            with col3:
-
-                price = st.number_input(
-                    "Harga",
-                    min_value=0,
-                    value=int(
-                        item["price"]
-                    ),
-                    step=1000,
-                    key=f"review_price_{index}",
-                )
-
-            edited_items.append(
-                {
-                    "item": item_name,
-                    "qty": qty,
-                    "price": price,
-                    "subtotal": qty * price,
-                }
-            )
-
-
-        # -----------------------------------------------
-        # ADD EXTRA ITEM
-        # -----------------------------------------------
-
-        if st.button(
-            "➕ Tambah Item Manual"
-        ):
-
-            current_items = (
-                st.session_state.receipt_data[
-                    "items"
-                ]
-            )
-
-            current_items.append(
-                {
-                    "item": "",
-                    "qty": 1,
-                    "price": 0,
-                    "subtotal": 0,
-                }
-            )
-
-            st.rerun()
-
-
-        # -----------------------------------------------
-        # AMOUNTS
-        # -----------------------------------------------
-
-        calculated_subtotal = sum(
-            item["subtotal"]
-            for item in edited_items
-        )
-
-        st.subheader(
-            "Nilai Transaksi"
-        )
-
-        col1, col2, col3 = st.columns(3)
-
-        with col1:
-
-            subtotal = st.number_input(
-                "Subtotal",
-                min_value=0,
-                value=int(
-                    receipt["subtotal"]
-                    or calculated_subtotal
-                ),
-                step=1000,
-                key="review_subtotal",
-            )
-
-        with col2:
-
-            tax = st.number_input(
-                "Pajak",
-                min_value=0,
-                value=int(
-                    receipt["tax"]
-                ),
-                step=1000,
-                key="review_tax",
-            )
-
-        with col3:
-
-            discount = st.number_input(
-                "Diskon",
-                min_value=0,
-                value=int(
-                    receipt["discount"]
-                ),
-                step=1000,
-                key="review_discount",
-            )
-
-
-        calculated_total = (
-            subtotal
-            + tax
-            - discount
-        )
-
-        total = st.number_input(
-            "TOTAL",
-            min_value=0,
-            value=int(
-                receipt["total"]
-                or calculated_total
-            ),
-            step=1000,
-            key="review_total",
-        )
-
-
-        note = st.text_area(
-            "Catatan",
-            key="review_note",
-        )
-
-
-        # -----------------------------------------------
-        # SUMMARY
-        # -----------------------------------------------
-
-        st.divider()
-
-        col1, col2, col3 = st.columns(3)
-
-        with col1:
-
-            st.metric(
-                "Subtotal",
-                f"Rp {subtotal:,.0f}",
-            )
-
-        with col2:
-
-            st.metric(
-                "Pajak",
-                f"Rp {tax:,.0f}",
-            )
-
-        with col3:
-
-            st.metric(
-                "Total",
-                f"Rp {total:,.0f}",
-            )
-
-
-        # -----------------------------------------------
-        # RAW OCR
-        # -----------------------------------------------
-
-        with st.expander(
-            "🔎 Lihat hasil OCR mentah"
-        ):
-
-            st.text(
-                st.session_state.ocr_text
-            )
-
-
-        # -----------------------------------------------
-        # SAVE BUTTON
-        # -----------------------------------------------
-
-        st.divider()
-
-        if st.button(
-            "💾 Simpan Receipt",
-            type="primary",
-            use_container_width=True,
-        ):
-
-            if not store.strip():
-
-                st.error(
-                    "Nama toko wajib diisi."
-                )
-
-                st.stop()
-
-            receipt_id = (
-                "RC-"
-                + datetime.now().strftime(
-                    "%Y%m%d"
-                )
-                + "-"
-                + uuid.uuid4().hex[:6].upper()
-            )
-
-            final_receipt = {
-                "date": transaction_date,
-                "store": store.strip(),
-                "subtotal": subtotal,
-                "tax": tax,
-                "discount": discount,
-                "total": total,
-                "items": edited_items,
-            }
-
-            try:
-
-                # ========================================
-                # 1. UPLOAD PHOTO
-                # ========================================
-
-                with st.spinner(
-                    "1/2 Upload foto ke Google Drive..."
-                ):
-
-                    drive_result = upload_to_drive(
-                        image_bytes=(
-                            st.session_state.image_bytes
-                        ),
-                        filename=(
-                            receipt_id
-                            + "_"
-                            + st.session_state.image_name
-                        ),
-                        mime_type=(
-                            st.session_state.mime_type
-                        ),
-                    )
-
-
-                # ========================================
-                # 2. SAVE DATA
-                # ========================================
-
-                with st.spinner(
-                    "2/2 Menyimpan data ke Google Sheets..."
-                ):
-
-                    save_receipt_to_sheet(
-                        receipt_data=(
-                            final_receipt
-                        ),
-                        receipt_id=receipt_id,
-                        photo_url=(
-                            drive_result["url"]
-                        ),
-                        category=category,
-                        payment_method=(
-                            payment_method
-                        ),
-                        note=note,
-                        ocr_text=(
-                            st.session_state.ocr_text
-                        ),
-                    )
-
-
-                st.success(
-                    "✅ Receipt berhasil disimpan!"
-                )
-
-                st.info(
-                    f"Receipt ID: {receipt_id}"
-                )
-
-                st.markdown(
-                    f"[📷 Buka Foto Receipt di Google Drive]"
-                    f"({drive_result['url']})"
-                )
-
-
-                # Reset after successful save.
-                clear_current_receipt()
-
-
-            except Exception as e:
-
-                st.error(
-                    "❌ Gagal menyimpan receipt."
-                )
-
-                st.exception(e)
-
-
-# ============================================================
-# HISTORY
-# ============================================================
-
-elif page == "Riwayat":
-
-    st.header(
-        "📋 Riwayat Receipt"
+    original_items = list(
+        receipt.get("items", [])
     )
 
-    try:
+    if not original_items:
+        original_items = [
+            {
+                "item": "",
+                "qty": 1,
+                "price": 0,
+                "subtotal": 0,
+            }
+        ]
 
+    edited_items = []
+
+    for index, item in enumerate(original_items):
+        col1, col2, col3 = st.columns([4, 1, 2])
+
+        with col1:
+            item_name = st.text_input(
+                f"Item {index + 1}",
+                value=item["item"],
+                key=f"item_{index}",
+            )
+
+        with col2:
+            qty = st.number_input(
+                "Qty",
+                min_value=1,
+                value=int(item["qty"]),
+                step=1,
+                key=f"qty_{index}",
+            )
+
+        with col3:
+            price = st.number_input(
+                "Harga",
+                min_value=0,
+                value=int(item["price"]),
+                step=1000,
+                key=f"price_{index}",
+            )
+
+        edited_items.append(
+            {
+                "item": item_name,
+                "qty": qty,
+                "price": price,
+                "subtotal": qty * price,
+            }
+        )
+
+    if st.button("➕ Tambah Item Manual"):
+        st.session_state.receipt_data["items"].append(
+            {
+                "item": "",
+                "qty": 1,
+                "price": 0,
+                "subtotal": 0,
+            }
+        )
+        st.rerun()
+
+    calculated_subtotal = sum(
+        item["subtotal"]
+        for item in edited_items
+    )
+
+    st.subheader("Nilai Transaksi")
+
+    col1, col2, col3 = st.columns(3)
+
+    with col1:
+        subtotal = st.number_input(
+            "Subtotal",
+            min_value=0,
+            value=int(
+                receipt["subtotal"] or calculated_subtotal
+            ),
+            step=1000,
+        )
+
+    with col2:
+        tax = st.number_input(
+            "Pajak",
+            min_value=0,
+            value=int(receipt["tax"]),
+            step=1000,
+        )
+
+    with col3:
+        discount = st.number_input(
+            "Diskon",
+            min_value=0,
+            value=int(receipt["discount"]),
+            step=1000,
+        )
+
+    calculated_total = (
+        subtotal + tax - discount
+    )
+
+    total = st.number_input(
+        "TOTAL",
+        min_value=0,
+        value=int(
+            receipt["total"] or calculated_total
+        ),
+        step=1000,
+    )
+
+    note = st.text_area(
+        "Catatan"
+    )
+
+    st.divider()
+
+    col1, col2, col3 = st.columns(3)
+
+    with col1:
+        st.metric(
+            "Subtotal",
+            f"Rp {subtotal:,.0f}",
+        )
+
+    with col2:
+        st.metric(
+            "Pajak",
+            f"Rp {tax:,.0f}",
+        )
+
+    with col3:
+        st.metric(
+            "Total",
+            f"Rp {total:,.0f}",
+        )
+
+    with st.expander("🔎 Lihat hasil OCR mentah"):
+        st.text(st.session_state.ocr_text)
+
+    st.divider()
+
+    if st.button(
+        "💾 Simpan Receipt",
+        type="primary",
+        use_container_width=True,
+    ):
+        if not store.strip():
+            st.error("Nama toko wajib diisi.")
+            return
+
+        if st.session_state.image_bytes is None:
+            st.error(
+                "Foto receipt tidak ditemukan. "
+                "Upload kembali foto receipt."
+            )
+            return
+
+        receipt_id = (
+            "RC-"
+            + datetime.now().strftime("%Y%m%d")
+            + "-"
+            + uuid.uuid4().hex[:6].upper()
+        )
+
+        final_receipt = {
+            "date": transaction_date,
+            "store": store.strip(),
+            "subtotal": subtotal,
+            "tax": tax,
+            "discount": discount,
+            "total": total,
+            "items": edited_items,
+        }
+
+        try:
+            with st.spinner(
+                "1/2 Upload foto ke Google Drive..."
+            ):
+                drive_result = upload_to_drive(
+                    image_bytes=st.session_state.image_bytes,
+                    filename=(
+                        receipt_id
+                        + "_"
+                        + st.session_state.image_name
+                    ),
+                    mime_type=(
+                        st.session_state.mime_type
+                        or "image/jpeg"
+                    ),
+                )
+
+            with st.spinner(
+                "2/2 Menyimpan data ke Google Sheets..."
+            ):
+                save_receipt_to_sheet(
+                    receipt_data=final_receipt,
+                    receipt_id=receipt_id,
+                    photo_url=drive_result["url"],
+                    category=category,
+                    payment_method=payment_method,
+                    note=note,
+                    ocr_text=st.session_state.ocr_text,
+                )
+
+            st.success(
+                "✅ Receipt berhasil disimpan."
+            )
+
+            st.info(
+                f"Receipt ID: {receipt_id}"
+            )
+
+            st.markdown(
+                f"[📷 Buka Foto di Google Drive]"
+                f"({drive_result['url']})"
+            )
+
+            clear_receipt_state()
+
+        except Exception as exc:
+            st.error(
+                "❌ Gagal menyimpan receipt."
+            )
+            st.exception(exc)
+
+
+# =========================================================
+# UI - HISTORY
+# =========================================================
+
+def show_history_page():
+    st.header("📋 Riwayat Receipt")
+
+    try:
         df = load_receipts()
 
         if df.empty:
+            st.info("Belum ada receipt.")
+            return
 
-            st.info(
-                "Belum ada receipt."
+        col1, col2 = st.columns(2)
+
+        with col1:
+            search = st.text_input(
+                "🔍 Cari toko"
             )
 
-        else:
+        with col2:
+            categories = sorted(
+                df["Kategori"]
+                .dropna()
+                .astype(str)
+                .unique()
+                .tolist()
+            )
 
-            col1, col2 = st.columns(2)
-
-            with col1:
-
-                search = st.text_input(
-                    "🔍 Cari toko"
-                )
-
-            with col2:
-
-                categories = sorted(
-                    df["Kategori"]
-                    .dropna()
-                    .astype(str)
-                    .unique()
-                    .tolist()
-                )
-
-                category_filter = st.selectbox(
-                    "Kategori",
-                    ["All"] + categories,
-                )
-
-
-            filtered = df.copy()
-
-            if search:
-
-                filtered = filtered[
-                    filtered["Toko"]
-                    .astype(str)
-                    .str.contains(
-                        search,
-                        case=False,
-                        na=False,
-                    )
-                ]
-
-            if category_filter != "All":
-
-                filtered = filtered[
-                    filtered["Kategori"]
-                    == category_filter
-                ]
-
-
-            display_columns = [
-                "Receipt_ID",
-                "Tanggal",
-                "Toko",
+            category_filter = st.selectbox(
                 "Kategori",
-                "Item",
-                "Qty",
-                "Harga",
-                "Subtotal_Item",
-                "Total",
-                "Metode_Pembayaran",
-                "Foto_URL",
-            ]
-
-            available_columns = [
-                column
-                for column in display_columns
-                if column in filtered.columns
-            ]
-
-            st.dataframe(
-                filtered[
-                    available_columns
-                ],
-                use_container_width=True,
-                hide_index=True,
+                ["All"] + categories,
             )
 
-    except Exception as e:
+        filtered = df.copy()
 
+        if search:
+            filtered = filtered[
+                filtered["Toko"]
+                .astype(str)
+                .str.contains(
+                    search,
+                    case=False,
+                    na=False,
+                )
+            ]
+
+        if category_filter != "All":
+            filtered = filtered[
+                filtered["Kategori"] == category_filter
+            ]
+
+        display_columns = [
+            "Receipt_ID",
+            "Tanggal",
+            "Toko",
+            "Kategori",
+            "Item",
+            "Qty",
+            "Harga",
+            "Subtotal_Item",
+            "Total",
+            "Metode_Pembayaran",
+            "Foto_URL",
+        ]
+
+        available = [
+            col
+            for col in display_columns
+            if col in filtered.columns
+        ]
+
+        st.dataframe(
+            filtered[available],
+            use_container_width=True,
+            hide_index=True,
+        )
+
+    except Exception as exc:
         st.error(
             "❌ Gagal membaca Google Sheets."
         )
+        st.exception(exc)
 
-        st.exception(e)
 
+# =========================================================
+# UI - DASHBOARD
+# =========================================================
 
-# ============================================================
-# DASHBOARD
-# ============================================================
-
-elif page == "Dashboard":
-
-    st.header(
-        "📊 Dashboard"
-    )
+def show_dashboard_page():
+    st.header("📊 Dashboard")
 
     try:
-
         df = load_receipts()
 
         if df.empty:
+            st.info("Belum ada data receipt.")
+            return
 
-            st.info(
-                "Belum ada data receipt."
+        df["Total"] = pd.to_numeric(
+            df["Total"],
+            errors="coerce",
+        )
+
+        receipt_summary = (
+            df.groupby(
+                "Receipt_ID",
+                as_index=False,
+            )
+            .first()
+        )
+
+        total_expense = (
+            receipt_summary["Total"]
+            .fillna(0)
+            .sum()
+        )
+
+        total_receipts = (
+            receipt_summary["Receipt_ID"]
+            .nunique()
+        )
+
+        col1, col2 = st.columns(2)
+
+        with col1:
+            st.metric(
+                "Total Pengeluaran",
+                f"Rp {total_expense:,.0f}",
             )
 
-        else:
-
-            df["Total"] = pd.to_numeric(
-                df["Total"],
-                errors="coerce",
+        with col2:
+            st.metric(
+                "Jumlah Receipt",
+                total_receipts,
             )
 
-            # Keep only one row per receipt
-            # for receipt-level calculations.
-            receipt_summary = (
-                df.groupby(
-                    "Receipt_ID",
-                    as_index=False,
-                )
-                .first()
-            )
+        st.divider()
 
-            total_expense = (
-                receipt_summary["Total"]
-                .fillna(0)
-                .sum()
-            )
+        category_data = (
+            receipt_summary
+            .groupby("Kategori")["Total"]
+            .sum()
+            .sort_values(ascending=False)
+        )
 
-            total_receipts = (
-                receipt_summary[
-                    "Receipt_ID"
-                ]
-                .nunique()
-            )
+        st.subheader(
+            "Pengeluaran Berdasarkan Kategori"
+        )
+
+        st.bar_chart(category_data)
+
+    except Exception as exc:
+        st.error(
+            "❌ Gagal mengambil data dashboard."
+        )
+        st.exception(exc)
 
 
-            # -------------------------------------------
-            # METRICS
-            # -------------------------------------------
+# =========================================================
+# MAIN
+# =========================================================
 
-            col1, col2 = st.columns(2)
+def main():
+    st.title("🧾 Receipt Tracker")
 
-            with col1:
+    st.caption(
+        "Foto Receipt → OCR → Review → "
+        "Google Drive + Google Sheets"
+    )
 
-                st.metric(
-                    "Total Pengeluaran",
-                    f"Rp {total_expense:,.0f}",
-                )
+    try:
+        ensure_sheet_header()
+    except Exception as exc:
+        st.error(
+            "Tidak dapat mengakses Google Sheets."
+        )
+        st.exception(exc)
+        st.info(
+            "Periksa nama spreadsheet, worksheet, "
+            "Service Account, dan Google Sheets API."
+        )
 
-            with col2:
+    page = st.sidebar.radio(
+        "Menu",
+        [
+            "Upload Receipt",
+            "Riwayat",
+            "Dashboard",
+            "Connection Test",
+        ],
+    )
 
-                st.metric(
-                    "Jumlah Receipt",
-                    total_receipts,
-                )
+    if page == "Upload Receipt":
+        show_upload_page()
+
+    elif page == "Riwayat":
+        show_history_page()
+
+    elif page == "Dashboard":
+        show_dashboard_page()
+
+    elif page == "Connection Test":
+        show_connection_test()
 
 
-            st.divider()
-
-
-            # -------------------------------------------
-            # CATEGORY CHART
-            # -------------------------------------------
-
-            category_data = (
-                receipt_summary
-                .groupby("Kategori")["Total"]
-                .sum()
-                .sort_values(
-                    ascending=False
-                )
-            )
-
-            st.subheader(
-                "Pengeluaran Berdasarkan Kategori"
-            )
-
-            st.bar_chart(
-                category_data
-            )
+if __name__ == "__main__":
+    main()
