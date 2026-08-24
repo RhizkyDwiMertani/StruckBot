@@ -1,6 +1,6 @@
-streamlit
-pandas
-gspread
-google-auth
-google-cloud-vision
-google-api-python-client
+streamlit>=1.42
+pandas>=2.2
+gspread>=6.0
+google-auth>=2.35
+google-cloud-vision>=3.8
+google-api-python-client>=2.150
